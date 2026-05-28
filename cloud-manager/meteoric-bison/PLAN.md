@@ -2,19 +2,16 @@
 
 ## Objective
 
-Refactor hive-deck-pro so the Go core becomes a JSON CLI library: every operation accepts a structured JSON payload as input and returns the existing text output unchanged. The cobra CLI becomes a thin arg-to-JSON wrapper; the MCP bypasses cobra and calls the JSON CLI directly. An operations contract — JSON Schema + markdown — is committed to the repo as the authoritative input specification. The end state is functionally 1:1 with the current version; only the internal wiring changes.
+Extract all hive-deck operation logic into an `ops/` Go library package. The cobra CLI continues to call `ops/` directly via Go imports — no change to how humans use `hv`. The `ops/` package additionally exposes a JSON dispatch entry point (`ops.Dispatch([]byte) string`) so non-Go callers can drive any operation by sending a JSON payload to stdin. The MCP (`mcp/src/runner.ts`) is updated to use this JSON stdin path instead of building cobra arg arrays. An operations contract (`ops/contract/CONTRACT.md` + `schema.json`) is committed to the repo documenting every operation's JSON input shape. The result is 1:1 functionally with the current version.
 
 ## Background
 
-Currently the MCP (`mcp/src/runner.ts`) invokes `hv <subcommand> [args...]` and constructs positional argument arrays. This is brittle — adding a new flag requires changes in three places (cobra command, MCP runner, MCP tool). The cobra CLI and MCP are tightly coupled through CLI argument conventions with no formal contract.
+Currently all operation logic lives directly in `cmd/hv/main.go` cobra `RunE` bodies. The MCP calls `hv <subcommand> [args...]`, constructing positional arg arrays. This creates two problems:
 
-The JSON CLI pattern decouples these layers:
-- The core Go logic exposes a single dispatch point: read a JSON payload, route to the correct operation handler, return text output
-- The cobra CLI becomes a pure translation layer: parse human-typed args → JSON → dispatch
-- The MCP constructs JSON directly → dispatch, skipping cobra entirely
-- The operations contract markdown file makes the JSON shape explicit and versionable
+1. **No formal contract**: there is no machine-readable spec of what inputs each operation accepts. Adding a flag requires touching cobra, the MCP runner, and the MCP tool separately.
+2. **Language boundary friction**: the MCP (TypeScript) has no way to call Go functions directly — it must go through the CLI. But the CLI was designed for human use, not programmatic use. Arg arrays are fragile; JSON is structured.
 
-This also unlocks future extensibility: any new caller (CI scripts, other MCPs, web hooks) can drive hive-deck by sending JSON without reimplementing CLI argument parsing.
+The fix: extract operation logic into `ops/`, keep cobra as a direct Go caller, expose a JSON dispatch path for the MCP. The JSON CLI interface exists **only because the MCP cannot import Go** — it is not a second user-facing CLI style. Cobra stays the human interface.
 
 ## Design
 
@@ -22,13 +19,14 @@ This also unlocks future extensibility: any new caller (CI scripts, other MCPs, 
 
 ```
 hive-deck-pro/
-├── cmd/hv/main.go              ← entry point unchanged (cobra wrapper)
-├── ops/                        ← NEW: JSON CLI backend
-│   ├── dispatch.go             ← ReadJSON → route → handler → output
-│   ├── contract.go             ← typed input structs for every operation
-│   ├── init.go                 ← InitOp handler
-│   ├── status.go               ← StatusOp handler
-│   ├── ship.go                 ← ShipOp handler
+├── cmd/hv/main.go              ← cobra CLI — unchanged user interface
+│                                  RunE bodies call ops.* directly via Go import
+├── ops/                        ← NEW: core Go library
+│   ├── dispatch.go             ← JSON entry point: ops.Dispatch([]byte) (string, error)
+│   ├── contract.go             ← typed input structs for every operation (shared by dispatch + cobra)
+│   ├── init.go                 ← RunInit(input InitInput) (string, error)
+│   ├── status.go               ← RunStatus(input StatusInput) (string, error)
+│   ├── ship.go                 ← RunShip(input ShipInput) (string, error)
 │   ├── sync.go
 │   ├── prune.go
 │   ├── next.go
@@ -41,101 +39,135 @@ hive-deck-pro/
 │   ├── mcp.go
 │   └── branch.go
 ├── ops/contract/
-│   ├── schema.json             ← JSON Schema for all operations
-│   └── CONTRACT.md             ← human-readable operations contract
-├── internal/                   ← existing packages unchanged
+│   ├── schema.json             ← JSON Schema (draft-07) — one entry per op
+│   └── CONTRACT.md             ← human-readable operations contract (NOT gitignored)
+├── internal/                   ← existing packages — unchanged
 │   ├── config/
 │   ├── resolve/
-│   ├── provision/
 │   └── ...
-└── mcp/src/runner.ts           ← updated: calls hv --json instead of hv <args>
+└── mcp/src/runner.ts           ← updated: sends JSON to hv stdin, reads stdout
 ```
 
-### Operations contract shape
+### Two caller paths — same ops/ library
 
-Each operation has a named input type. The JSON payload always has an `op` discriminator field:
+```
+Human / terminal:
+  hv status cloud-manager
+    → cmd/hv cobra RunE
+    → ops.RunStatus(StatusInput{Deck: "cloud-manager"})   ← direct Go call
+    → string output printed
 
-```json
-{ "op": "status", "deck": "cloud-manager" }
-{ "op": "init",   "deck": "cloud-manager" }
-{ "op": "ship",   "deck": "cloud-manager", "message": "fix: ...", "title": "fix: ..." }
-{ "op": "next",   "deck": "cloud-manager" }
-{ "op": "sync",   "deck": "cloud-manager" }
-{ "op": "prune",  "deck": "cloud-manager" }
-{ "op": "stash",  "deck": "cloud-manager" }
-{ "op": "unstash","deck": "cloud-manager" }
-{ "op": "teardown","deck": "cloud-manager" }
-{ "op": "workflow","deck": "cloud-manager", "name": "create-workflow", "list": false }
-{ "op": "decks" }
-{ "op": "list",   "deck": "cloud-manager" }
-{ "op": "mcp",    "deck": "cloud-manager" }
-{ "op": "branch", "deck": "cloud-manager" }
+MCP / TypeScript:
+  runHv({ op: "status", deck: "cloud-manager" })
+    → JSON marshaled to stdin
+    → hv binary reads stdin, calls ops.Dispatch(payload)
+    → ops.Dispatch routes to ops.RunStatus(...)
+    → string output returned to MCP
 ```
 
-### JSON CLI invocation
+The JSON path is an **additional entry point on the same binary** — not a separate binary or mode flag. The binary detects stdin is piped JSON and dispatches accordingly (or: a minimal `--json` flag triggers the dispatch path — implementation detail resolved in Phase 0001).
 
-```bash
-# Via stdin (MCP path — preferred, no shell quoting issues)
-echo '{"op":"status","deck":"cloud-manager"}' | hv --json
+### ops/contract.go — input structs
 
-# Via --json flag (scripting path)
-hv --json '{"op":"status","deck":"cloud-manager"}'
+```go
+package ops
+
+type StatusInput  struct { Op string `json:"op"` ; Deck string `json:"deck"` }
+type InitInput    struct { Op string `json:"op"` ; Deck string `json:"deck"` }
+type ShipInput    struct { Op string `json:"op"` ; Deck string `json:"deck"` ; Message string `json:"message"` ; Title string `json:"title"` ; Body string `json:"body,omitempty"` }
+type NextInput    struct { Op string `json:"op"` ; Deck string `json:"deck"` }
+type SyncInput    struct { Op string `json:"op"` ; Deck string `json:"deck"` }
+type PruneInput   struct { Op string `json:"op"` ; Deck string `json:"deck"` }
+type StashInput   struct { Op string `json:"op"` ; Deck string `json:"deck"` }
+type UnstashInput struct { Op string `json:"op"` ; Deck string `json:"deck"` }
+type TeardownInput struct{ Op string `json:"op"` ; Deck string `json:"deck"` }
+type WorkflowInput struct{ Op string `json:"op"` ; Deck string `json:"deck"` ; Name string `json:"name,omitempty"` ; List bool `json:"list,omitempty"` }
+type DecksInput   struct { Op string `json:"op"` }
+type ListInput    struct { Op string `json:"op"` ; Deck string `json:"deck"` }
+type McpInput     struct { Op string `json:"op"` ; Deck string `json:"deck"` }
+type BranchInput  struct { Op string `json:"op"` ; Deck string `json:"deck"` }
 ```
 
-### `ops/dispatch.go`
+### ops/dispatch.go — JSON entry point
 
 ```go
 func Dispatch(payload []byte) (string, error) {
-    var base struct { Op string `json:"op"` }
+    var base struct{ Op string `json:"op"` }
     if err := json.Unmarshal(payload, &base); err != nil {
-        return "", fmt.Errorf("invalid JSON: %w", err)
+        return "", fmt.Errorf("invalid JSON payload: %w", err)
     }
     switch base.Op {
-    case "status":  return runStatus(payload)
-    case "init":    return runInit(payload)
-    case "ship":    return runShip(payload)
-    // ...etc
+    case "status":
+        var in StatusInput
+        json.Unmarshal(payload, &in)
+        return RunStatus(in)
+    case "init":
+        var in InitInput
+        json.Unmarshal(payload, &in)
+        return RunInit(in)
+    case "ship":
+        var in ShipInput
+        json.Unmarshal(payload, &in)
+        return RunShip(in)
+    // ... all ops
     default:
-        return "", fmt.Errorf("unknown op %q", base.Op)
+        return "", fmt.Errorf("unknown op %q — see ops/contract/CONTRACT.md", base.Op)
     }
 }
 ```
 
-### Cobra wrapper pattern
-
-Each cobra command becomes a marshal-and-dispatch call:
+### cmd/hv cobra — direct Go call (unchanged interface)
 
 ```go
-// Before:
-runE: func(cmd *cobra.Command, args []string) error {
-    deck := args[0]
-    return doStatus(deck)
+// status cobra command — before:
+RunE: func(cmd *cobra.Command, args []string) error {
+    // inline logic here
 }
 
-// After:
-runE: func(cmd *cobra.Command, args []string) error {
-    payload, _ := json.Marshal(ops.StatusInput{Op: "status", Deck: args[0]})
-    out, err := ops.Dispatch(payload)
+// status cobra command — after:
+RunE: func(cmd *cobra.Command, args []string) error {
+    out, err := ops.RunStatus(ops.StatusInput{Deck: args[0]})
     if err != nil { return err }
     fmt.Print(out)
     return nil
 }
 ```
 
+User experience: `hv status cloud-manager` works identically.
+
+### JSON stdin entry point in cmd/hv/main.go
+
+```go
+func main() {
+    // If stdin is piped, treat it as a JSON dispatch call
+    stat, _ := os.Stdin.Stat()
+    if (stat.Mode() & os.ModeCharDevice) == 0 {
+        payload, _ := io.ReadAll(os.Stdin)
+        out, err := ops.Dispatch(payload)
+        if err != nil { fmt.Fprintln(os.Stderr, "error:", err); os.Exit(1) }
+        fmt.Print(out)
+        return
+    }
+    // Otherwise: cobra CLI
+    rootCmd.Execute()
+}
+```
+
+No flag needed — piped stdin triggers JSON mode automatically. Human use (`hv status cloud-manager`) never pipes stdin so cobra always wins.
+
 ### MCP runner update
 
 ```typescript
-// Before:
+// runner.ts — before:
 export function runHv(...args: string[]): RunResult {
-  const result = spawnSync(HV_BIN, args, { ... });
+  const result = spawnSync(HV_BIN, args, { encoding: "utf-8", stdio: ["ignore","pipe","pipe"] });
   ...
 }
 
-// After:
+// runner.ts — after:
 export function runHv(payload: object): RunResult {
-  const json = JSON.stringify(payload);
-  const result = spawnSync(HV_BIN, ["--json"], {
-    input: json,
+  const result = spawnSync(HV_BIN, [], {
+    input: JSON.stringify(payload),
     encoding: "utf-8",
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -143,35 +175,30 @@ export function runHv(payload: object): RunResult {
 }
 ```
 
-Each MCP tool constructs a payload object instead of an arg array:
-
+Each MCP tool replaces arg arrays with payload objects:
 ```typescript
 // Before: runHv("status", deck)
 // After:  runHv({ op: "status", deck })
+
+// Before: runHv("ship", deck, "--message", message, "--title", title)
+// After:  runHv({ op: "ship", deck, message, title })
 ```
 
-### CONTRACT.md
+### ops/contract/CONTRACT.md
 
-Committed at `ops/contract/CONTRACT.md`. Documents every operation: op name, required fields, optional fields, example payload, example output. Not gitignored — this is a first-class project artifact.
+Committed, not gitignored. Documents every op: name, required fields, optional fields, example JSON payload, example output. This is the authoritative spec for the JSON interface.
 
-### schema.json
+### ops/contract/schema.json
 
-`ops/contract/schema.json` — JSON Schema (draft-07) with a `oneOf` discriminated on `"op"`. Each branch validates the fields for that operation. The `dispatch.go` does NOT validate against the schema at runtime (too slow); the schema is for tooling and documentation only.
+JSON Schema draft-07. `oneOf` discriminated union on `"op"`. Used by tooling and documentation; not validated at runtime (typed Go structs handle that).
 
 ## Implementation phases
 
 | Phase | Title | Description |
 |-------|-------|-------------|
 | 0000 | Setup | hv_status + hv_next |
-| 0001 | ops/ package + contract | Create `ops/` package with `contract.go` (all input structs) and `dispatch.go` (routing skeleton). Write `CONTRACT.md` and `schema.json`. No handlers wired yet — dispatch returns "not implemented" for all ops. |
-| 0002 | Port handlers | Move logic from `cmd/hv/main.go` cobra RunE bodies into `ops/*.go` handlers. Wire each into dispatch. Build + all existing `go test ./...` pass. |
-| 0003 | Slim cobra wrapper | Replace cobra RunE bodies with marshal→dispatch→print. `cmd/hv/main.go` becomes a pure translation layer. Add `--json` flag to root command. `hv --json '...'` and `echo '...' \| hv --json` both work. |
-| 0004 | Update MCP runner | Change `runHv(...args)` to `runHv(payload: object)` in `runner.ts`. Update every call site in MCP tools. Rebuild MCP. End-to-end test: `hv_status`, `hv_ship`, `hv_workflow` all work via JSON path. |
-| 0005 | Ship | Tests pass, contract files committed, make install works, ship hive-deck-pro. |
-
-## Open questions
-
-- **`--json` flag vs subcommand**: Using `hv --json <payload>` keeps the binary name and makes the JSON path opt-in. Alternative is a dedicated `hv json` subcommand. Flag is cleaner since it avoids polluting the subcommand list. Recommend flag.
-- **Stdin vs flag for JSON input**: Supporting both (stdin when `--json` has no value, flag value when provided) gives the most flexibility. MCP uses stdin to avoid shell quoting; humans use the flag. Recommend both.
-- **Schema validation at runtime**: Validating JSON Schema on every dispatch adds ~5ms and a dependency. Not worth it for v1 — the typed Go structs provide sufficient validation. Schema is docs-only.
-- **gitignore of CONTRACT.md**: Contract should NOT be gitignored — it is a first-class project artifact. The existing gitignore rule `*.md` in the deck config applies to the workspace folder, not the repo contents. No action needed.
+| 0001 | ops/ skeleton + contract | Create `ops/` package with `contract.go` (all input structs) and `dispatch.go` (routing). Write `CONTRACT.md` and `schema.json`. Handlers return `"not implemented"` stubs. `go build` passes. |
+| 0002 | Port handlers | Move logic from `cmd/hv/main.go` RunE bodies into `ops/*.go` handler functions. Wire each into dispatch. `go test ./...` passes. Cobra still calls inline logic (not yet wired to ops). |
+| 0003 | Wire cobra to ops | Replace cobra RunE inline logic with `ops.Run*()` direct calls. Add stdin-piped JSON dispatch to `main()`. `hv <subcommand>` output unchanged. `echo '{"op":"status","deck":"X"}' \| hv` works. |
+| 0004 | Update MCP runner | Change `runHv(...args)` → `runHv(payload: object)` in `runner.ts`. Update every MCP tool call site. Rebuild MCP. Test `hv_status`, `hv_ship`, `hv_workflow` end-to-end. |
+| 0005 | Ship | All tests pass, contract files committed, `make install` works, ship hive-deck-pro. |
