@@ -7,7 +7,7 @@ audit columns are shown explicitly on each entity in the diagram below.
 
 ## Schemas
 
-The Postgres database splits tables across four schemas:
+The Postgres database splits tables across five schemas:
 
 | Schema       | Tables |
 |--------------|--------|
@@ -15,15 +15,17 @@ The Postgres database splits tables across four schemas:
 | `network`    | `configurations`, `addresses` |
 | `membership` | `organizations`, `users`, `roles`, `teams`, `user_roles`, `user_teams`, `team_roles` |
 | `vm`         | `virtual_machines`, `virtual_machine_images`, `snapshots`, `orchestration_commands`, `playbooks`, `playbook_revisions`, `ansible_roles`, `role_files`, `role_file_revisions`, `playbook_global_role_refs`, `playbook_roles`, `playbook_role_files`, `playbook_role_file_revisions`, `vm_playbook_assignments`, `playbook_runs`, `playbook_run_targets` |
+| `ansible`    | `collections`, `host_collections`, `collection_install_runs`, `playbook_collection_requirements` |
 | `public`     | `VirtualDevices` *(unschemed, PascalCase — not yet migrated)* |
 
 ## Enums
 
-| Enum                 | Values                                            | Storage     |
-|----------------------|---------------------------------------------------|-------------|
-| `OrchestrationStatus`| `Initialized`, `InProgress`, `Completed`, `Failed`| Postgres enum (string) |
-| `MachineStatus`      | `Running`, `Off`                                  | Postgres enum (string) |
-| `PlaybookRunStatus`  | `None`, `Queued`, `Running`, `Succeeded`, `Failed`, `Cancelled` | Postgres enum (int) |
+| Enum                       | Values                                            | Storage     |
+|----------------------------|---------------------------------------------------|-------------|
+| `OrchestrationStatus`      | `Initialized`, `InProgress`, `Completed`, `Failed`| Postgres enum (string) |
+| `MachineStatus`            | `Running`, `Off`                                  | Postgres enum (string) |
+| `PlaybookRunStatus`        | `None`, `Queued`, `Running`, `Succeeded`, `Failed`, `Cancelled` | Postgres enum (int) |
+| `CollectionInstallStatus`  | `Pending`, `Installing`, `Installed`, `Failed`, `Removing`, `Removed` | Postgres enum (string) |
 
 ## Identifier Strategy
 
@@ -474,6 +476,72 @@ erDiagram
     VirtualMachine ||--o{ VmPlaybookAssignment : "assign.virtual_machine_id"
     VirtualMachine ||--o{ PlaybookRunTarget : "target.vm_id"
     VmPlaybookAssignment |o--o{ PlaybookRunTarget : "target.assignment_id"
+
+    %% ─── ansible ───
+    AnsibleCollection {
+        uuid id PK
+        string public_id UK
+        string namespace
+        string name
+        string description
+        string source_url
+        string latest_known_version
+        datetime created
+        string created_by
+        datetime modified
+        string modified_by
+    }
+    HostAnsibleCollection {
+        uuid id PK
+        string public_id UK
+        uuid host_id FK
+        uuid collection_id FK
+        string version
+        string install_path
+        CollectionInstallStatus install_status
+        uuid last_install_run_id FK
+        string error_message
+        datetime created
+        string created_by
+        datetime modified
+        string modified_by
+    }
+    AnsibleCollectionInstallRun {
+        uuid id PK
+        string public_id UK
+        uuid host_id FK
+        uuid collection_id FK
+        string requested_version
+        PlaybookRunStatus status
+        string output
+        string error_message
+        datetime started_at
+        datetime completed_at
+        datetime created
+        string created_by
+        datetime modified
+        string modified_by
+    }
+    PlaybookCollectionRequirement {
+        uuid id PK
+        string public_id UK
+        uuid playbook_id FK
+        uuid collection_id FK
+        string min_version
+        string max_version
+        datetime created
+        string created_by
+        datetime modified
+        string modified_by
+    }
+
+    AnsibleCollection ||--o{ HostAnsibleCollection : "host_coll.collection_id"
+    Host ||--o{ HostAnsibleCollection : "host_coll.host_id"
+    AnsibleCollection ||--o{ AnsibleCollectionInstallRun : "install_run.collection_id"
+    Host ||--o{ AnsibleCollectionInstallRun : "install_run.host_id"
+    AnsibleCollectionInstallRun |o--o{ HostAnsibleCollection : "host_coll.last_install_run_id"
+    AnsibleCollection ||--o{ PlaybookCollectionRequirement : "req.collection_id"
+    Playbook ||--o{ PlaybookCollectionRequirement : "req.playbook_id"
 ```
 
 ## Notes
@@ -515,3 +583,40 @@ erDiagram
   created without a formal assignment (ad-hoc targeting in future).
 - **`VmPlaybookAssignment.last_run_id`** points to `PlaybookRun` (the overall
   run), not to an individual target row.
+- **`ansible` schema** is the home for Ansible-content registry concerns that
+  are not scoped to a single VM: known collections, what's installed on each
+  host, async install jobs, and per-playbook collection requirements. The
+  existing `vm.ansible_roles` / `vm.role_files` tables stay where they are for
+  now — they could logically move to `ansible.*` in a future cleanup but moving
+  them is out of scope for this delta.
+- **`AnsibleCollection`** is the catalog of collections cloud-manager knows
+  about — identified by the Galaxy-style `{namespace}.{name}` pair (e.g.
+  `community.postgresql`). `latest_known_version` is a cache populated by a
+  catalog-refresh job; the actual installed version per host lives on
+  `HostAnsibleCollection`. `(namespace, name)` is unique.
+- **`HostAnsibleCollection`** is the per-host install record — the many-to-many
+  between a host and a collection, plus the installed `version`, the on-disk
+  `install_path`, and the lifecycle `install_status`. `(host_id, collection_id)`
+  is unique: a host has at most one row per collection. `last_install_run_id`
+  is nullable and points at the most recent `AnsibleCollectionInstallRun` for
+  diagnostics. `host_id` cascades on host delete; `collection_id` is RESTRICT
+  so a collection still installed somewhere cannot be silently dropped.
+- **`AnsibleCollectionInstallRun`** is the async-job record for an attempted
+  install or upgrade — analogous to `PlaybookRun`. Cloud-manager-api creates a
+  row in `Queued`, publishes a message to the worker queue, and the worker
+  (vorch-service or an equivalent host-side agent) shells out to
+  `ansible-galaxy collection install …`, streams stdout/stderr into `output`,
+  and writes the final `status`. The lifecycle reuses `PlaybookRunStatus`
+  because the state machine is identical (queued → running → succeeded /
+  failed / cancelled). `requested_version` is nullable — null means "install
+  the latest version".
+- **`PlaybookCollectionRequirement`** is the declarative requirement edge —
+  which collections a given playbook needs in order to run, with optional
+  `min_version` and `max_version` bounds. At trigger time, cloud-manager-api
+  joins this against `HostAnsibleCollection` for the target host and refuses
+  to dispatch (or auto-enqueues install jobs) if any required collection is
+  missing or out of range. `(playbook_id, collection_id)` is unique.
+- **Collection installs are scoped to a host, not to a VM.** Ansible runs from
+  a controller, not on the managed nodes; collections are part of the
+  controller's runtime, so they live on `bare_metal.hosts`. A future host-pool
+  abstraction would change the FK target but not the shape.
