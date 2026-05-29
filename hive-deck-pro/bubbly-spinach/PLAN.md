@@ -109,13 +109,116 @@ internal/builtin/
       rebuild-mcp-artifacts.md
 ```
 
-### Assembly in RunWorkflow
-1. Load `_base.yaml` from binary
-2. If name given: load `~/.hv/workflows/<type>/<name>.yaml` from disk
-3. Validate: phases array present if name given; each phase has title + jobs
-4. For each phase: render the task fragment with `{{.PhaseTitle}}` and `{{.Jobs}}` injected
-5. Wrap with built-in init (front) and post (back)
-6. Resolve all tokens: built-in set + custom tokens from extension YAML
+### Go model shapes
+
+**Built-in base** (`internal/builtin/<type>/_base.yaml` → loaded into `BuiltinBase`):
+```go
+// BuiltinBase is embedded in the binary for both "workflow" and "plan" types.
+// Init and Post are the fixed bookends — the user never touches these.
+type BuiltinBase struct {
+    Type string      `yaml:"type"` // "workflow" | "plan"
+    Init BaseSection `yaml:"init"` // always Task 0000
+    Post BaseSection `yaml:"post"` // always Task FINAL
+}
+
+type BaseSection struct {
+    Fragments []string `yaml:"fragments"` // e.g. ["@status-check", "@write-task-0000"]
+}
+```
+
+**User extension — workflow** (`~/.hv/workflows/workflow/<name>.yaml`):
+```go
+// WorkflowExtension is what the user defines. It fills the slot between
+// base.Init and base.Post. Tokens layer on top of the built-in token set.
+type WorkflowExtension struct {
+    Tokens map[string]string `yaml:"tokens"` // optional custom tokens
+    Phases []Phase           `yaml:"phases"` // one TASK file per phase
+}
+
+type Phase struct {
+    Title string   `yaml:"title"`
+    Jobs  []string `yaml:"jobs"` // fragment refs, e.g. "@check-database"
+}
+```
+
+**User extension — plan** (`~/.hv/workflows/plan/<name>.yaml`):
+```go
+// PlanExtension appends additional fragments after the base plan fragments.
+// Simpler than workflow: no phase/job hierarchy, just extra steps.
+type PlanExtension struct {
+    Tokens    map[string]string `yaml:"tokens"`
+    Fragments []string          `yaml:"fragments"`
+}
+```
+
+**Assembled result** (internal, passed to renderer):
+```go
+// AssembledWorkflow is the merged output of base + extension, ready to render.
+type AssembledWorkflow struct {
+    Type   string            // "workflow" | "plan"
+    Tokens map[string]string // built-in tokens merged with user custom tokens
+    Tasks  []AssembledTask
+}
+
+type AssembledTask struct {
+    Number    string   // "0000", "0001", ..., "FINAL"
+    Title     string
+    Source    string   // "builtin" | "user"
+    Fragments []string // resolved fragment content for this task
+}
+```
+
+---
+
+### Where the user extension slots in
+
+```
+BuiltinBase.Init  ─────────────────────────────────  Task 0000  (built-in, always)
+                         ▲
+WorkflowExtension.Phases ┤  phases[0]  ──────────────  Task 0001  (user)
+                         │  phases[1]  ──────────────  Task 0002  (user)
+                         │  phases[N]  ──────────────  Task 000N  (user)
+                         ▼
+BuiltinBase.Post  ─────────────────────────────────  Task FINAL  (built-in, always)
+```
+
+The base has no middle. The slot between Init and Post is empty unless an extension
+fills it. Base-only mode (`hv workflow <deck>` with no name) produces just Task 0000
+and Task FINAL — a valid minimal workflow for simple changes.
+
+---
+
+### Merge mechanism in RunWorkflow
+
+```
+RunWorkflow(type, deck, name?)
+  │
+  ├─ 1. Load BuiltinBase from embed.FS
+  │       binary://internal/builtin/<type>/_base.yaml
+  │
+  ├─ 2. Build built-in token set
+  │       Deck, Branch, DeckRoot, PlanFolder, ExecFolder,
+  │       PRMode, Agent, DeleteBranchOnMerge, OpenBrowser
+  │
+  ├─ 3. If name given → load extension from disk
+  │       ~/.hv/workflows/<type>/<name>.yaml
+  │       Validate: workflow→phases not empty, each phase has title+jobs
+  │                 plan→fragments not empty
+  │       Merge tokens: built-in set + extension.Tokens
+  │       (user tokens can reference built-in tokens: "{{.DeckRoot}}/tools/foo")
+  │
+  ├─ 4. Assemble task list
+  │       Task 0000  ← base.Init.Fragments       (always first)
+  │       Task 0001  ← phases[0] jobs expanded   (user, workflow only)
+  │       Task 000N  ← phases[N] jobs expanded   (user, workflow only)
+  │       Task FINAL ← base.Post.Fragments       (always last)
+  │
+  └─ 5. Render: resolve all {{.Token}} across all fragment content
+          → assembled prompt string returned to caller
+```
+
+For `plan` type, step 4 is flat: `base.Fragments + extension.Fragments` in order.
+No task splitting — plan assembly produces a single prompt, not a task file per phase.
 
 ### Token changes
 | Old | New | Derivation |
