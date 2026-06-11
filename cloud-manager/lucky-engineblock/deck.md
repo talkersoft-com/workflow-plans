@@ -8,8 +8,9 @@
 |------|-------------|
 | `cloud-manager-api` | Blueprint/BlueprintPlaybook/BlueprintEvent entities, VM.BlueprintId, migration, seeds, Blueprint+Marketplace controllers/services, run sequencer |
 | `cloud-manager-mcp` | New `marketplace.ts` tools, profile registration, dist rebuild |
-| `cloud-manager-web` | Marketplace page, Blueprints builder page, nav + feature flag |
 | `workflow-plans` | This plan folder |
+
+(cloud-manager-web is deliberately NOT in this plan — the UI ships in the follow-up plan.)
 
 Repos not listed will be on the feature branch but skipped by hv_ship. **vorch-lib, vorch-service,
 and porch must not change** (deck convention; the design requires no changes there).

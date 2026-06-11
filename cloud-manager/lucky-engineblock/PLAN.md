@@ -115,15 +115,8 @@ New `src/tools/marketplace.ts`, registered in the `hv.cloud` profile:
 
 ### Web (cloud-manager-web)
 
-- `/marketplace` — browse published blueprints (cards: name, base image OS badge, playbook count);
-  "Create VM" flow from a card: pick host + name + optional memory/disk overrides (recipe replaces
-  the image/spec steps of the wizard), then redirects to the VM detail page ("then the users can
-  see the vm").
-- `/blueprints` (+ `/blueprints/{id}`) — builder/admin: compose image + ordered playbooks
-  (drag-or-buttons reorder), edit vars per playbook, publish/archive.
-- Nav: "Marketplace" as a top-level item (peer of Virtual Machines), "Blueprints" under it or
-  adjacent; both gated on the `marketplace` feature flag (same pattern as the `playbooks` flag).
-- Existing Create VM wizard and all `/ansible/*` pages untouched.
+**Moved to the follow-up UI plan** (next plan in the series — the marketplace is planned layer by
+layer; this plan delivers the backend the UI consumes). No web changes ship from this plan.
 
 ### Migration + seed
 
@@ -145,8 +138,7 @@ New `src/tools/marketplace.ts`, registered in the `hv.cloud` profile:
 | 0002 | API: blueprint + marketplace controllers | Services/DTOs/mappers/controllers for CRUD, lifecycle, ordered playbook management, marketplace listing, instantiate (MVP: assignments + provision; runs via existing apply); feature-flag gating; BlueprintEvents |
 | 0003 | Run sequencer | BlueprintRunSequencer hooked to orchestration-completed and run-succeeded writebacks; ordered auto-run with stop-on-failure semantics + events |
 | 0004 | MCP marketplace tools | `marketplace.ts` tools incl. provision-from-marketplace; profile registration; dist rebuild |
-| 0005 | Web: Marketplace + Blueprints pages | Browse/instantiate flow + builder page with ordering; nav + feature flag; existing pages untouched |
-| 0006 | End-to-end verification + results | Seeded jammy instantiates from marketplace (no playbooks); postgres-jammy instantiates and reaches a succeeded ordered run on a live VM; direct attach/apply regression check; RESULT.md + ship |
+| 0005 | End-to-end verification + results | Seeded jammy instantiates from marketplace (no playbooks, via API/MCP); postgres-jammy instantiates and reaches a succeeded ordered run on a live VM; direct attach/apply regression check; RESULT.md + ship |
 
 Phases 0002/0003 are deliberately split so the riskiest piece (event-driven sequencing) can be
 reviewed and reverted independently of the CRUD surface.
