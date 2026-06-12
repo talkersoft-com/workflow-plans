@@ -75,6 +75,11 @@ web-01 ansible_host=10.0.0.12 ansible_user=cloudmanager ansible_ssh_private_key_
 }
 ```
 
+> **As-built deviation (P1):** the wire field carrying the public id is `id`, not `publicId`,
+> matching the repo-wide CRUD DTO convention (`Blueprint`, `Playbook`, …). Event timeline rows
+> keep `publicId` (VmEvent DTO convention). Values are public ids in both cases; raw Guids
+> never appear on the wire.
+
 ### Feature flag + seed
 
 Migration seeds the `ansible-studio` FeatureFlag row (Enabled=false, Healthy=true — pure
